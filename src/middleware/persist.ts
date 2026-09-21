@@ -31,14 +31,24 @@ type JsonStorageOptions = {
 export function createJSONStorage<S, R = unknown>(
   getStorage: () => StateStorage<R>,
   options?: JsonStorageOptions,
-): PersistStorage<S, unknown> | undefined {
+): PersistStorage<S, unknown> {
   let storage: StateStorage<R> | undefined
-  try {
-    storage = getStorage()
-  } catch {
-    // prevent error if the storage is not defined (e.g. when server side rendering a page)
-    return
+
+  // The getter is evaluated lazily on the first storage access and retried on
+  // every subsequent access until it succeeds. This prevents errors in
+  // environments where the storage is temporarily unavailable (e.g. SSR or a
+  // browser in privacy mode where touching localStorage throws).
+  const resolveStorage = (): StateStorage<R> | undefined => {
+    if (storage) return storage
+    try {
+      storage = getStorage()
+    } catch {
+      // prevent error if the storage is not defined (e.g. when server side
+      // rendering a page or when localStorage access throws in privacy mode)
+    }
+    return storage
   }
+
   const persistStorage: PersistStorage<S, R> = {
     getItem: (name) => {
       const parse = (str: string | null) => {
@@ -47,15 +57,25 @@ export function createJSONStorage<S, R = unknown>(
         }
         return JSON.parse(str, options?.reviver) as StorageValue<S>
       }
-      const str = storage.getItem(name) ?? null
+      const activeStorage = resolveStorage()
+      if (!activeStorage) {
+        return null
+      }
+      const str = activeStorage.getItem(name) ?? null
       if (str instanceof Promise) {
         return str.then(parse)
       }
       return parse(str)
     },
-    setItem: (name, newValue) =>
-      storage.setItem(name, JSON.stringify(newValue, options?.replacer)),
-    removeItem: (name) => storage.removeItem(name),
+    setItem: (name, newValue) => {
+      return resolveStorage()?.setItem(
+        name,
+        JSON.stringify(newValue, options?.replacer),
+      ) as R
+    },
+    removeItem: (name) => {
+      return resolveStorage()?.removeItem(name) as R
+    },
   }
   return persistStorage
 }
@@ -205,20 +225,13 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
   const finishHydrationListeners = new Set<PersistListener<S>>()
   let storage = options.storage
 
-  if (!storage) {
-    return config(
-      (...args) => {
-        console.warn(
-          `[zustand persist middleware] Unable to update item '${options.name}', the given storage is currently unavailable.`,
-        )
-        set(...(args as Parameters<typeof set>))
-      },
-      get,
-      api,
-    )
-  }
-
   const setItem = () => {
+    if (!storage) {
+      console.warn(
+        `[zustand persist middleware] Unable to update item '${options.name}', the given storage is currently unavailable.`,
+      )
+      return
+    }
     const state = options.partialize({ ...get() })
     return (storage as PersistStorage<S, unknown>).setItem(options.name, {
       state,
