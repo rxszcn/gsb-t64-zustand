@@ -33,11 +33,15 @@ export function createJSONStorage<S, R = unknown>(
   options?: JsonStorageOptions,
 ): PersistStorage<S, unknown> | undefined {
   let storage: StateStorage<R> | undefined
-  try {
-    storage = getStorage()
-  } catch {
-    // prevent error if the storage is not defined (e.g. when server side rendering a page)
-    return
+  // The storage getter is evaluated lazily, only when the storage is first
+  // accessed. If it throws (e.g. `localStorage` is unavailable during SSR or
+  // in privacy mode), the error surfaces to the caller and the getter is
+  // retried on the next access, so the storage can still become available later.
+  const getStateStorage = () => {
+    if (!storage) {
+      storage = getStorage()
+    }
+    return storage
   }
   const persistStorage: PersistStorage<S, R> = {
     getItem: (name) => {
@@ -47,15 +51,18 @@ export function createJSONStorage<S, R = unknown>(
         }
         return JSON.parse(str, options?.reviver) as StorageValue<S>
       }
-      const str = storage.getItem(name) ?? null
+      const str = getStateStorage().getItem(name) ?? null
       if (str instanceof Promise) {
         return str.then(parse)
       }
       return parse(str)
     },
     setItem: (name, newValue) =>
-      storage.setItem(name, JSON.stringify(newValue, options?.replacer)),
-    removeItem: (name) => storage.removeItem(name),
+      getStateStorage().setItem(
+        name,
+        JSON.stringify(newValue, options?.replacer),
+      ),
+    removeItem: (name) => getStateStorage().removeItem(name),
   }
   return persistStorage
 }
@@ -205,25 +212,22 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
   const finishHydrationListeners = new Set<PersistListener<S>>()
   let storage = options.storage
 
-  if (!storage) {
-    return config(
-      (...args) => {
-        console.warn(
-          `[zustand persist middleware] Unable to update item '${options.name}', the given storage is currently unavailable.`,
-        )
-        set(...(args as Parameters<typeof set>))
-      },
-      get,
-      api,
-    )
-  }
-
   const setItem = () => {
     const state = options.partialize({ ...get() })
-    return (storage as PersistStorage<S, unknown>).setItem(options.name, {
-      state,
-      version: options.version,
-    })
+    try {
+      return (storage as PersistStorage<S, unknown> | undefined)?.setItem(
+        options.name,
+        {
+          state,
+          version: options.version,
+        },
+      )
+    } catch {
+      // the storage is currently unavailable (e.g. its getter still throws)
+    }
+    console.warn(
+      `[zustand persist middleware] Unable to update item '${options.name}', the given storage is currently unavailable.`,
+    )
   }
 
   const savedSetState = api.setState
